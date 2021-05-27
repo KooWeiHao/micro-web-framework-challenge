@@ -14,6 +14,14 @@ module.exports = (sequelize, Sequelize) =>{
             type: Sequelize.TEXT('long'),
             allowNull: false
         },
+        width:{
+            type: Sequelize.INTEGER,
+            allowNull: false
+        },
+        height:{
+            type: Sequelize.INTEGER,
+            allowNull: false
+        },
         createdDate:{
             type: Sequelize.DATE,
             allowNull: false,

@@ -2,35 +2,72 @@ const tmp = require("tmp");
 const fs = require("fs");
 const extractZip = require('extract-zip');
 const mimeTypes = require('mime-types');
+const imageSize = require('image-size');
+const sharp = require('sharp');
 
 const db = require("../models");
 const imageDb = db.image;
 
-const returnError = (res, error, status = 500)=>{
+const returnErrorResponse = (res, error, status = 500)=>{
     console.error(error);
     res.status(status).send({
         message: error
     });
 }
+const generateUploadResponse = (dataList, data)=>{
+    dataList.push({
+        name: data.name,
+        width: data.width,
+        height: data.height,
+        link: data.imageId ? `${process.env.BACKEND_DOMAIN}/image/get-image-by-image-id/${data.imageId}` : null,
+        message: data.error ? `Failed. ${data.error}` : "Success"
+    });
 
-const uploadImage = (picture, res) =>{
-    const image = {
-        name: picture.name,
-        source: picture.data.toString("base64") //store image base64 string
+    return dataList;
+};
+
+
+const generateThumbnail = async (picture)=>{
+    const thumbnails = [];
+    const maximumArea = 128 * 128;
+
+    const buffer = picture.data;
+    const dimension = imageSize(buffer);
+    const width = dimension.width;
+    const height = dimension.height;
+    const area = width * height;
+
+    const resize = async (newWidth)=>{
+        const newHeight = Math.round((newWidth/width) * height);
+        const newBuffer = await sharp(buffer).resize(newWidth, newHeight).toBuffer();
+        return {
+            name: picture.name,
+            source: newBuffer.toString("base64"),
+            width: newWidth,
+            height: newHeight
+        }
     };
 
-    imageDb.create(image).then(data =>{
-        res.send({
-            name: data.name,
-            link: `${process.env.BACKEND_DOMAIN}/image/get-image-by-image-id/${data.imageId}`,
-            message: "Success"
+    //generate two thumbnails with width 32 and 64 respectively if exceed maximumArea, else use original image as thumbnail
+    if(area > maximumArea){
+        const newThumbnails = [await resize(32), await resize(64)];
+        newThumbnails.forEach(t =>{
+            thumbnails.push(t);
         });
-    }).catch(err =>{
-        returnError(res, err);
-    });
-}
+    }
+    else{
+        thumbnails.push({
+            name: picture.name,
+            source: buffer.toString("base64"),
+            width: width,
+            height: height
+        });
+    }
 
-const uploadZip = (zip, res) =>{
+    return thumbnails;
+};
+
+const extractUploadedZip = async (zip)=>{
     //store uploaded zip file to a temp folder
     const tmpDir = tmp.dirSync();
     const tmpDirPath = tmpDir.name;
@@ -38,64 +75,105 @@ const uploadZip = (zip, res) =>{
     const tmpZipPath = tmpZip.name;
     fs.writeFileSync(tmpZipPath, zip.data);
 
-    extractZip(tmpZipPath, {dir: tmpDirPath}).then(async ()=>{
-        const datas = [];
-        const pictures = fs.readdirSync(tmpDirPath);
-        for (let picture of pictures) {
-            const absolutePath = `${tmpDir.name}\\${picture}`;
-            const pushData = (imageId, error) =>{
-                datas.push({
-                    name: picture,
-                    link: imageId ? `${process.env.BACKEND_DOMAIN}/image/get-image-by-image-id/${imageId}` : null,
-                    message: error ? `Failed. ${error}` : "Success"
-                });
-            };
-            const mimeType = mimeTypes.lookup(absolutePath);
+    //extract all files in zip to a temp folder
+    await extractZip(tmpZipPath, {dir: tmpDirPath});
 
-            if(!["image/jpeg","image/png"].includes(mimeType)){
-                pushData(null, "Only PNG and JPG are supported");
-            }
-            else{
-                const blob = fs.readFileSync(absolutePath);
-                const image = {
-                    name: picture,
-                    source: new Buffer.from(blob).toString('base64')
-                };
-
-                try{
-                    const data = await imageDb.create(image);
-                    pushData(data.imageId, null);
-                }
-                catch (err){
-                    pushData(null, err);
-                }
-            }
+    //read all files from temp folder
+    const files = fs.readdirSync(tmpDirPath);
+    return files.map(file =>{
+        return {
+            name: file,
+            path: `${tmpDirPath}\\${file}`
         }
-
-        res.send(datas);
-    }).catch(err =>{
-        returnError(res, err);
     });
 };
 
+const uploadZip = async (zip) =>{
+    let datas = [];
+    const pictures = await extractUploadedZip(zip);
+
+    for (let picture of pictures){
+        const data = {
+            name: picture.name,
+            width: null,
+            height: null,
+            imageId: null,
+            error: null
+        };
+
+        //image validation
+        const mimeType = mimeTypes.lookup(picture.path);
+        if(!["image/jpeg","image/png"].includes(mimeType)){
+            data.error = "Only PNG and JPG are supported";
+            generateUploadResponse(datas, data);
+        }
+        else{
+            const blob = fs.readFileSync(picture.path);
+            const images = await uploadImage({
+                name: picture.name,
+                data: new Buffer.from(blob)
+            });
+            datas = [...datas, ...images];
+        }
+    }
+
+    return datas;
+};
+
+const uploadImage = async (picture) =>{
+    const datas = [];
+    const images = await generateThumbnail(picture);
+
+    for(let image of images){
+        const data = {
+            name: image.name,
+            width: image.width,
+            height: image.height,
+            imageId: null,
+            error: null
+        };
+
+        try{
+            const result = await imageDb.create(image);
+            data.imageId = result.imageId;
+            generateUploadResponse(datas, data);
+        }
+        catch (err){
+            console.error(err);
+            data.error = err;
+            generateUploadResponse(datas, data);
+        }
+    }
+
+    return datas;
+}
+
 exports.upload = (req, res)=>{
     if(!req.files){
-        returnError(res, "No file is uploaded", 400);
+        returnErrorResponse(res, "No file is uploaded", 400);
     }
     else{
         const file = Object.entries(req.files)[0][1];
 
         switch (file.mimetype){
             case "image/jpeg": case "image/png":
-                uploadImage(file, res);
+                uploadImage(file).then(data =>{
+                    res.send(data);
+                }).catch(err =>{
+                    returnErrorResponse(res, err);
+                });
                 break;
 
             case "application/zip":
-                uploadZip(file, res);
+                uploadZip(file, res).then(data =>{
+                    res.send(data);
+                }).catch(err =>{
+                    returnErrorResponse(res, err);
+                });
                 break;
 
             default:
-                returnError(res, "Only PNG, JPG and ZIP are supported", 400);
+                returnErrorResponse(res, "Only PNG, JPG and ZIP are supported", 400);
                 break;
         }
     }
@@ -112,9 +190,9 @@ exports.getImageByImageId = (req, res)=>{
             res.sendFile(tmpPngPath);
         }
         else{
-            returnError(res, `Failed to get image by ImageId=${req.params.imageId}`, 400);
+            returnErrorResponse(res, `Failed to get image by ImageId=${req.params.imageId}`, 400);
         }
     }).catch(err =>{
-        returnError(res, err);
+        returnErrorResponse(res, err);
     });
 };
