@@ -1,4 +1,4 @@
-# technical-assessment-service-rocket
+# Micro Web Framework Challenge
 
 <ins>Tech Stack</ins>
 * Micro web framework - ExpressJS for JavaScript
